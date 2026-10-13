@@ -109,11 +109,11 @@ do {
     }
     cursor = page.nextCursor();
 } while (cursor != null);</code></pre>
-    <blockquote>
-      If you do this yourself, watch out for <code>OFFSET</code>-based pagination on large collections. Deep offsets get
-      slower as the offset grows, because the database still has to skip all those rows. Cursor (keyset) pagination on an
-      indexed field keeps every page equally cheap.
-    </blockquote>
+    <p>
+      We used <b>keyset (cursor) pagination</b> instead of <code>OFFSET</code>. With an offset, every page gets slower as you
+      go deeper, because the database still has to scan and skip all the earlier rows. A cursor on an indexed field keeps
+      page 1,000 as cheap as page 1. The same change helped cut our P99 query latency from over 2s to under a second.
+    </p>
 
     <h2>Fix 3: take it off the request path with Kafka</h2>
     <p>
@@ -122,7 +122,7 @@ do {
     </p>
     <ol>
       <li>The API validates the request, publishes an export event to Kafka, and returns a job ID right away.</li>
-      <li>A consumer picks up the event, runs the paginated, streaming export, and stores the finished file.</li>
+      <li>A consumer picks up the event, runs the paginated, streaming export, and uploads the finished file to <b>S3</b> in batches.</li>
       <li>The client polls the job status, or gets notified, and downloads the file when it's ready.</li>
     </ol>
     <p>This also brought some side benefits:</p>
@@ -137,6 +137,7 @@ do {
       <thead><tr><th></th><th>Before</th><th>After</th></tr></thead>
       <tbody>
         <tr><td>Practical row limit</td><td>~10K</td><td>100K+</td></tr>
+        <tr><td>OOM incidents</td><td>Recurring</td><td>Eliminated</td></tr>
         <tr><td>Memory vs. rows</td><td>Grows linearly</td><td>Flat (window + one page)</td></tr>
         <tr><td>Execution</td><td>Inside the HTTP request</td><td>Async Kafka job</td></tr>
       </tbody>
@@ -152,7 +153,7 @@ do {
 
     <div class="article-footer">
       Questions or a different approach? Reach me on
-      <a href="https://linkedin.com/in/manish-j-bangera" target="_blank" rel="noopener">LinkedIn</a> or by
+      <a href="https://www.linkedin.com/in/manish-j-bangera-02891616a/" target="_blank" rel="noopener">LinkedIn</a> or by
       <a href="mailto:manishjbangera@gmail.com">email</a>.
     </div>
   </main>
