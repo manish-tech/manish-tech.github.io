@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Streaming Excel Exports at Constant Memory — Manish J Bangera</title>
+  <meta name="description" content="How a catalog export went from a 10K-row ceiling to 100K+ rows at constant memory using Apache POI SXSSF, paginated reads, and async Kafka jobs." />
+  <meta property="og:title" content="From 10K to 100K+ rows: streaming Excel exports at constant memory" />
+  <meta property="og:type" content="article" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2310b981'/><text x='16' y='22' font-family='monospace' font-size='16' font-weight='700' text-anchor='middle' fill='%23052e1f'>mb</text></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../styles.css" />
+  <script>
+    try { const t = localStorage.getItem('theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+  </script>
+</head>
+<body>
+  <header class="nav">
+    <div class="container nav-inner">
+      <a href="../index.html" class="logo"><span class="logo-mark">mb</span> manish.bangera</a>
+      <nav class="nav-links">
+        <a href="../index.html#work">Work</a>
+        <a href="../index.html#writing">Writing</a>
+        <a href="../index.html#contact">Contact</a>
+        <button class="theme-toggle" id="themeToggle" aria-label="Toggle color theme">
+          <svg class="icon-sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+          <svg class="icon-moon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        </button>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container article">
+    <a class="back" href="../index.html#writing">← All writing</a>
+    <h1>From 10K to 100K+ rows: streaming Excel exports at constant memory</h1>
+    <span class="post-date">Oct 2026 · 6 min read</span>
+
+    <p>
+      Retailers on our platform export their product catalogs to Excel all the time, for bulk edits, audits, and sharing
+      with marketplaces. For a long time the export had an unofficial limit: <b>around 10,000 rows</b>.
+      Beyond that, requests timed out or the service ran out of heap, and we'd tell the customer to split the export.
+    </p>
+    <p>
+      That doesn't work for a retailer with a six-figure catalog. This post covers the three changes that let the same
+      service export <b>100K+ rows with flat memory usage</b>.
+    </p>
+
+    <h2>Why it broke: the whole workbook lived in memory</h2>
+    <p>The original code was the version you write first, and it's correct for small files:</p>
+<pre><code>Workbook wb = new XSSFWorkbook();
+Sheet sheet = wb.createSheet("Products");
+List&lt;Product&gt; products = repository.findAllByTenant(tenantId); // everything, at once
+for (Product p : products) {
+    Row row = sheet.createRow(rowIdx++);
+    // ... populate cells
+}
+wb.write(response.getOutputStream());</code></pre>
+    <p>It has two problems, and both grow linearly with catalog size:</p>
+    <ol>
+      <li><b>All the data is loaded up front.</b> Every product document is in a <code>List</code> before the first row is written.</li>
+      <li><b><code>XSSFWorkbook</code> keeps the full XML tree in memory.</b> Each cell is an object, and each object has overhead.
+        An in-memory <code>.xlsx</code> takes up many times its size on disk.</li>
+    </ol>
+    <p>It also ran synchronously inside an HTTP request, so even when memory held, the request timeout didn't.</p>
+
+    <h2>Fix 1: stream the workbook with SXSSF</h2>
+    <p>
+      Apache POI ships a streaming variant, <code>SXSSFWorkbook</code>. It keeps a <em>sliding window</em> of rows in memory
+      and flushes older rows to a temporary file as you go. Memory now depends on the window size, not on how many rows
+      you write.
+    </p>
+<pre><code>SXSSFWorkbook wb = new SXSSFWorkbook(100); // keep only 100 rows in memory
+wb.setCompressTempFiles(true);
+try {
+    Sheet sheet = wb.createSheet("Products");
+    // ... write rows ...
+    wb.write(out);
+} finally {
+    wb.dispose(); // delete the temp files, or they pile up on disk
+    wb.close();
+}</code></pre>
+    <p>A few things to know:</p>
+    <ul>
+      <li><b>Write only, forward only.</b> Once a row is flushed you can't go back to it. Anything like column widths or
+        summary rows has to be planned before you start writing.</li>
+      <li><b>Avoid <code>autoSizeColumn</code>.</b> It needs every row in memory and defeats the point. Set fixed widths instead.</li>
+      <li><b>Always call <code>dispose()</code>.</b> Temp files are written to disk, and forgetting to clean them up turns a memory
+        problem into a disk problem.</li>
+    </ul>
+    <p>
+      Imports have the same problem in reverse. A <code>.xlsx</code> upload parsed with <code>XSSFWorkbook</code> loads
+      everything into memory. For large uploads, POI's event-based SAX reader (<code>XSSFReader</code> with a sheet handler)
+      gives you one row at a time.
+    </p>
+
+    <h2>Fix 2: read the data in pages</h2>
+    <p>
+      A streaming writer doesn't help if you still load the whole catalog first. We changed the Couchbase N1QL reads to
+      fetch fixed-size pages and write each page to the sheet before fetching the next one. At any moment, memory holds
+      one page of documents plus the SXSSF window.
+    </p>
+<pre><code>String cursor = null;
+do {
+    Page&lt;Product&gt; page = productRepository.fetchPage(tenantId, cursor, PAGE_SIZE);
+    for (Product p : page.items()) {
+        writeRow(sheet, p);
+    }
+    cursor = page.nextCursor();
+} while (cursor != null);</code></pre>
+    <blockquote>
+      If you do this yourself, watch out for <code>OFFSET</code>-based pagination on large collections. Deep offsets get
+      slower as the offset grows, because the database still has to skip all those rows. Cursor (keyset) pagination on an
+      indexed field keeps every page equally cheap.
+    </blockquote>
+
+    <h2>Fix 3: take it off the request path with Kafka</h2>
+    <p>
+      Even when it's efficient, a 100K-row export takes longer than you'd want an HTTP request to stay open. So the export
+      became a job:
+    </p>
+    <ol>
+      <li>The API validates the request, publishes an export event to Kafka, and returns a job ID right away.</li>
+      <li>A consumer picks up the event, runs the paginated, streaming export, and stores the finished file.</li>
+      <li>The client polls the job status, or gets notified, and downloads the file when it's ready.</li>
+    </ol>
+    <p>This also brought some side benefits:</p>
+    <ul>
+      <li><b>Backpressure for free.</b> A burst of exports queues up on the topic instead of overloading the service.</li>
+      <li><b>Retries.</b> A failed export can be retried without the user doing anything.</li>
+      <li><b>Isolation.</b> One tenant's huge export no longer slows down other tenants' API calls.</li>
+    </ul>
+
+    <h2>The result</h2>
+    <table>
+      <thead><tr><th></th><th>Before</th><th>After</th></tr></thead>
+      <tbody>
+        <tr><td>Practical row limit</td><td>~10K</td><td>100K+</td></tr>
+        <tr><td>Memory vs. rows</td><td>Grows linearly</td><td>Flat (window + one page)</td></tr>
+        <tr><td>Execution</td><td>Inside the HTTP request</td><td>Async Kafka job</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Takeaways</h2>
+    <ul>
+      <li><b>Look for anything that loads "all" of something.</b> <code>findAll</code>, building the whole document in memory, and
+        collecting results into a list all work in dev and break in production.</li>
+      <li><b>Streaming has to work end to end.</b> A streaming writer fed by a non-streaming reader is still a non-streaming system.</li>
+      <li><b>Long-running work belongs in a job, not a request.</b> Once something can take more than a few seconds, make it asynchronous.</li>
+    </ul>
+
+    <div class="article-footer">
+      Questions or a different approach? Reach me on
+      <a href="https://linkedin.com/in/manish-j-bangera" target="_blank" rel="noopener">LinkedIn</a> or by
+      <a href="mailto:manishjbangera@gmail.com">email</a>.
+    </div>
+  </main>
+
+  <footer class="container footer">
+    <p>© <span id="year"></span> Manish J Bangera</p>
+  </footer>
+  <script src="../script.js"></script>
+</body>
+</html>
